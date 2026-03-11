@@ -344,11 +344,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // --append-system-prompt-file (Claude CLI forbids using both flags together).
   let effectiveInstructionsFilePath = instructionsFilePath;
   if (instructionsFilePath) {
-    const instructionsContent = await fs.readFile(instructionsFilePath, "utf-8");
-    const pathDirective = `\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${instructionsFileDir}.`;
-    const combinedPath = path.join(skillsDir, "agent-instructions.md");
-    await fs.writeFile(combinedPath, instructionsContent + pathDirective, "utf-8");
-    effectiveInstructionsFilePath = combinedPath;
+    try {
+      const instructionsContent = await fs.readFile(instructionsFilePath, "utf-8");
+      const pathDirective = `\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${instructionsFileDir}.`;
+      const combinedPath = path.join(skillsDir, "agent-instructions.md");
+      await fs.writeFile(combinedPath, instructionsContent + pathDirective, "utf-8");
+      effectiveInstructionsFilePath = combinedPath;
+    } catch (err) {
+      await onLog(
+        "stderr",
+        `[paperclip] Warning: could not read instructionsFilePath "${instructionsFilePath}": ${err instanceof Error ? err.message : String(err)}. Continuing without injected instructions.\n`,
+      );
+      effectiveInstructionsFilePath = "";
+    }
   }
 
   // Write a sourceable env file so agents can `source` it in bash commands.

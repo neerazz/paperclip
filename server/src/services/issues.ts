@@ -55,7 +55,7 @@ function applyStatusSideEffects(
 }
 
 export interface IssueFilters {
-  status?: string;
+  status?: string | string[];
   assigneeAgentId?: string;
   assigneeUserId?: string;
   touchedByUserId?: string;
@@ -458,8 +458,11 @@ export function issueService(db: Db) {
         )
       `;
       if (filters?.status) {
-        const statuses = filters.status.split(",").map((s) => s.trim());
-        conditions.push(statuses.length === 1 ? eq(issues.status, statuses[0]) : inArray(issues.status, statuses));
+        const raw = filters.status;
+        const statuses = (Array.isArray(raw) ? raw : raw.split(",")).map((s) => s.trim()).filter(Boolean);
+        if (statuses.length > 0) {
+          conditions.push(statuses.length === 1 ? eq(issues.status, statuses[0]) : inArray(issues.status, statuses));
+        }
       }
       if (filters?.assigneeAgentId) {
         conditions.push(eq(issues.assigneeAgentId, filters.assigneeAgentId));
@@ -569,14 +572,14 @@ export function issueService(db: Db) {
       }));
     },
 
-    countUnreadTouchedByUser: async (companyId: string, userId: string, status?: string) => {
+    countUnreadTouchedByUser: async (companyId: string, userId: string, status?: string | string[]) => {
       const conditions = [
         eq(issues.companyId, companyId),
         isNull(issues.hiddenAt),
         unreadForUserCondition(companyId, userId),
       ];
       if (status) {
-        const statuses = status.split(",").map((s) => s.trim()).filter(Boolean);
+        const statuses = (Array.isArray(status) ? status : status.split(",")).map((s) => s.trim()).filter(Boolean);
         if (statuses.length === 1) {
           conditions.push(eq(issues.status, statuses[0]));
         } else if (statuses.length > 1) {
