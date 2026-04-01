@@ -20,6 +20,7 @@ import {
   removeMaintainerOnlySkillSymlinks,
   renderTemplate,
   joinPromptSections,
+  buildResumedSessionPrompt,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "../index.js";
@@ -359,20 +360,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : "";
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const paperclipEnvNote = renderPaperclipEnvNote(env);
-  const prompt = joinPromptSections([
+  const isResumedSession = Boolean(sessionId);
+
+  const effectivePrompt = isResumedSession
+    ? buildResumedSessionPrompt(wakeReason ?? "", wakeTaskId ?? "", runId)
+    : renderedPrompt;
+  const freshSessionPrompt = joinPromptSections([
     instructionsPrefix,
     renderedBootstrapPrompt,
     sessionHandoffNote,
     paperclipEnvNote,
     renderedPrompt,
   ]);
+  const prompt = isResumedSession
+    ? joinPromptSections([sessionHandoffNote, effectivePrompt])
+    : freshSessionPrompt;
   const promptMetrics = {
     promptChars: prompt.length,
-    instructionsChars,
+    instructionsChars: isResumedSession ? 0 : instructionsPrefix.length,
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
-    runtimeNoteChars: paperclipEnvNote.length,
-    heartbeatPromptChars: renderedPrompt.length,
+    runtimeNoteChars: isResumedSession ? 0 : paperclipEnvNote.length,
+    heartbeatPromptChars: effectivePrompt.length,
+    sessionResumed: isResumedSession ? 1 : 0,
   };
 
   const buildArgs = (resumeSessionId: string | null) => {
@@ -385,7 +395,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return args;
   };
 
-  const runAttempt = async (resumeSessionId: string | null) => {
+  const runAttempt = async (resumeSessionId: string | null, stdinPrompt = prompt) => {
     const args = buildArgs(resumeSessionId);
     if (onMeta) {
       await onMeta({
@@ -395,7 +405,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         commandNotes,
         commandArgs: args,
         env: loggedEnv,
-        prompt,
+        prompt: stdinPrompt,
         promptMetrics,
         context,
       });
@@ -430,7 +440,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       env,
       timeoutSec,
       graceSec,
-      stdin: prompt,
+      stdin: stdinPrompt,
       onSpawn,
       onLog: async (stream, chunk) => {
         if (stream !== "stdout") {
@@ -527,7 +537,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       "stdout",
       `[paperclip] Cursor resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
     );
-    const retry = await runAttempt(null);
+    const retry = await runAttempt(null, freshSessionPrompt);
     return toResult(retry, true);
   }
 

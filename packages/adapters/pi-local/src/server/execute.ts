@@ -21,6 +21,7 @@ import {
   removeMaintainerOnlySkillSymlinks,
   renderTemplate,
   runChildProcess,
+  buildResumedSessionPrompt,
 } from "@paperclipai/adapter-utils/server-utils";
 import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
@@ -304,17 +305,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const effectiveSystemPrompt = canResumeSession ? "" : renderedSystemPromptExtension;
+  const effectiveHeartbeatPrompt = canResumeSession
+    ? buildResumedSessionPrompt(wakeReason ?? "", wakeTaskId ?? "", runId)
+    : renderedHeartbeatPrompt;
+
   const userPrompt = joinPromptSections([
     renderedBootstrapPrompt,
     sessionHandoffNote,
-    renderedHeartbeatPrompt,
+    effectiveHeartbeatPrompt,
   ]);
   const promptMetrics = {
-    systemPromptChars: renderedSystemPromptExtension.length,
+    systemPromptChars: effectiveSystemPrompt.length,
     promptChars: userPrompt.length,
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
-    heartbeatPromptChars: renderedHeartbeatPrompt.length,
+    heartbeatPromptChars: effectiveHeartbeatPrompt.length,
+    sessionResumed: canResumeSession ? 1 : 0,
   };
 
   const commandNotes = (() => {
@@ -338,7 +345,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     args.push("-p"); // Non-interactive mode: process prompt and exit
     
     // Use --append-system-prompt to extend Pi's default system prompt
-    args.push("--append-system-prompt", renderedSystemPromptExtension);
+    if (effectiveSystemPrompt) {
+      args.push("--append-system-prompt", effectiveSystemPrompt);
+    }
     
     if (provider) args.push("--provider", provider);
     if (modelId) args.push("--model", modelId);

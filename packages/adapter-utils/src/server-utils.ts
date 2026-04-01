@@ -193,6 +193,18 @@ export function joinPromptSections(
     .join(separator);
 }
 
+/**
+ * Build a compact prompt for resumed sessions where the agent already has
+ * full instructions and context from the initial session setup.
+ */
+export function buildResumedSessionPrompt(wakeReason: string, taskId: string, runId: string): string {
+  const parts = [`Heartbeat run ${runId}.`];
+  if (wakeReason) parts.push(`Reason: ${wakeReason}.`);
+  if (taskId) parts.push(`Task: ${taskId}.`);
+  parts.push("Continue your Paperclip work.");
+  return parts.join(" ");
+}
+
 export function redactEnvForLogs(env: Record<string, string>): Record<string, string> {
   const redacted: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {

@@ -12,6 +12,7 @@ import {
   parseObject,
   parseJson,
   buildPaperclipEnv,
+  buildResumedSessionPrompt,
   readPaperclipRuntimeSkillEntries,
   joinPromptSections,
   buildInvocationEnvForLogs,
@@ -390,16 +391,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const envBlock = [
     "\n\n## Paperclip Runtime Environment",
     "",
-    "Claude Code's Bash tool does NOT inherit process env vars. To use PAPERCLIP_* vars in bash, either:",
-    `1. Run \`source "${envFilePath}"\` at the start of your bash command`,
-    "2. Or use these literal values directly:",
-    "",
-    "```",
-    ...Object.entries(env)
-      .filter(([k]) => k.startsWith("PAPERCLIP_") && k !== "PAPERCLIP_API_KEY")
-      .map(([k, v]) => `${k}=${v}`),
-    ...(env.PAPERCLIP_API_KEY ? [`PAPERCLIP_API_KEY=<set, use source command above>`] : []),
-    "```",
+    `To access PAPERCLIP_* variables in bash commands, run: source "${envFilePath}"`,
   ].join("\n");
 
   if (effectiveInstructionsFilePath) {
@@ -424,6 +416,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${cwd}".\n`,
     );
   }
+  const isResumedSession = Boolean(sessionId);
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
   const templateData = {
     agentId: agent.id,
@@ -440,16 +433,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-  const prompt = joinPromptSections([
+  const wakeReason = asString(context.wakeReason, "");
+  const wakeTaskId = asString(context.taskId, asString(context.issueId, ""));
+
+  const effectivePrompt = isResumedSession
+    ? buildResumedSessionPrompt(wakeReason ?? "", wakeTaskId ?? "", runId)
+    : renderedPrompt;
+  const freshSessionPrompt = joinPromptSections([
     renderedBootstrapPrompt,
     sessionHandoffNote,
     renderedPrompt,
   ]);
+  const prompt = isResumedSession
+    ? joinPromptSections([sessionHandoffNote, effectivePrompt])
+    : freshSessionPrompt;
   const promptMetrics = {
     promptChars: prompt.length,
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
-    heartbeatPromptChars: renderedPrompt.length,
+    heartbeatPromptChars: effectivePrompt.length,
+    sessionResumed: isResumedSession ? 1 : 0,
   };
 
   const buildClaudeArgs = (resumeSessionId: string | null) => {
@@ -484,7 +487,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : `Claude exited with code ${proc.exitCode ?? -1}`;
   };
 
-  const runAttempt = async (resumeSessionId: string | null) => {
+  const runAttempt = async (resumeSessionId: string | null, stdinPrompt = prompt) => {
     const args = buildClaudeArgs(resumeSessionId);
     if (onMeta) {
       await onMeta({
@@ -503,7 +506,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const proc = await runChildProcess(runId, command, args, {
       cwd,
       env,
-      stdin: prompt,
+      stdin: stdinPrompt,
       timeoutSec,
       graceSec,
       onSpawn,
@@ -627,7 +630,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "stdout",
         `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
       );
-      const retry = await runAttempt(null);
+      const retry = await runAttempt(null, freshSessionPrompt);
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
     }
 

@@ -22,6 +22,7 @@ import {
   removeMaintainerOnlySkillSymlinks,
   parseObject,
   renderTemplate,
+  buildResumedSessionPrompt,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "../index.js";
@@ -303,7 +304,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const paperclipEnvNote = renderPaperclipEnvNote(env);
   const apiAccessNote = renderApiAccessNote(env);
-  const prompt = joinPromptSections([
+  const isResumedSession = Boolean(sessionId);
+
+  const effectivePrompt = isResumedSession
+    ? buildResumedSessionPrompt(wakeReason ?? "", wakeTaskId ?? "", runId)
+    : renderedPrompt;
+  const freshSessionPrompt = joinPromptSections([
     instructionsPrefix,
     renderedBootstrapPrompt,
     sessionHandoffNote,
@@ -311,16 +317,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     apiAccessNote,
     renderedPrompt,
   ]);
+  const prompt = isResumedSession
+    ? joinPromptSections([sessionHandoffNote, effectivePrompt])
+    : freshSessionPrompt;
   const promptMetrics = {
     promptChars: prompt.length,
-    instructionsChars: instructionsPrefix.length,
+    instructionsChars: isResumedSession ? 0 : instructionsPrefix.length,
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
-    runtimeNoteChars: paperclipEnvNote.length + apiAccessNote.length,
-    heartbeatPromptChars: renderedPrompt.length,
+    runtimeNoteChars: isResumedSession ? 0 : paperclipEnvNote.length + apiAccessNote.length,
+    heartbeatPromptChars: effectivePrompt.length,
+    sessionResumed: isResumedSession ? 1 : 0,
   };
 
-  const buildArgs = (resumeSessionId: string | null) => {
+  const buildArgs = (resumeSessionId: string | null, attemptPrompt = prompt) => {
     const args = ["--output-format", "stream-json"];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     if (model && model !== DEFAULT_GEMINI_LOCAL_MODEL) args.push("--model", model);
@@ -331,12 +341,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       args.push("--sandbox=none");
     }
     if (extraArgs.length > 0) args.push(...extraArgs);
-    args.push("--prompt", prompt);
+    args.push("--prompt", attemptPrompt);
     return args;
   };
 
-  const runAttempt = async (resumeSessionId: string | null) => {
-    const args = buildArgs(resumeSessionId);
+  const runAttempt = async (resumeSessionId: string | null, attemptPrompt = prompt) => {
+    const args = buildArgs(resumeSessionId, attemptPrompt);
     if (onMeta) {
       await onMeta({
         adapterType: "gemini_local",
@@ -460,7 +470,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       "stdout",
       `[paperclip] Gemini resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
     );
-    const retry = await runAttempt(null);
+    const retry = await runAttempt(null, freshSessionPrompt);
     return toResult(retry, true, true);
   }
 
