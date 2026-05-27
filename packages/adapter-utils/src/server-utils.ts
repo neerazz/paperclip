@@ -15,6 +15,7 @@ export interface RunProcessResult {
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;
+  outputActivityTimedOut?: boolean;
   stdout: string;
   stderr: string;
   pid: number | null;
@@ -24,6 +25,13 @@ export interface RunProcessResult {
 export interface TerminalResultCleanupOptions {
   hasTerminalResult: (output: { stdout: string; stderr: string }) => boolean;
   graceMs?: number;
+}
+
+export interface OutputActivityTimeoutOptions {
+  timeoutMs: number;
+  graceMs?: number;
+  hasActivity: (output: { chunk: string; stdout: string }) => boolean;
+  onTimeout?: (input: { timeoutMs: number; elapsedMs: number }) => void;
 }
 
 interface RunningProcess {
@@ -1908,6 +1916,7 @@ export async function runChildProcess(
     onLogError?: (err: unknown, runId: string, message: string) => void;
     onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
+    outputActivityTimeout?: OutputActivityTimeoutOptions;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
   },
@@ -1969,6 +1978,15 @@ export async function runChildProcess(
         let terminalCleanupKillTimer: NodeJS.Timeout | null = null;
         let terminalResultStdoutScanOffset = 0;
         let terminalResultStderrScanOffset = 0;
+        let outputActivityTimedOut = false;
+        let lastOutputActivityAt = Date.now();
+        let outputActivityTimer: NodeJS.Timeout | null = null;
+        let outputActivityKillTimer: NodeJS.Timeout | null = null;
+
+        const outputActivityTimeout =
+          opts.outputActivityTimeout && opts.outputActivityTimeout.timeoutMs > 0
+            ? opts.outputActivityTimeout
+            : null;
 
         const clearTerminalCleanupTimers = () => {
           if (terminalCleanupTimer) clearTimeout(terminalCleanupTimer);
@@ -1976,6 +1994,53 @@ export async function runChildProcess(
           terminalCleanupTimer = null;
           terminalCleanupKillTimer = null;
         };
+
+        const clearOutputActivityTimers = () => {
+          if (outputActivityTimer) clearTimeout(outputActivityTimer);
+          if (outputActivityKillTimer) clearTimeout(outputActivityKillTimer);
+          outputActivityTimer = null;
+          outputActivityKillTimer = null;
+        };
+
+        const armOutputActivityTimer = () => {
+          if (!outputActivityTimeout || timedOut || outputActivityTimedOut) return;
+          if (outputActivityTimer) clearTimeout(outputActivityTimer);
+          outputActivityTimer = setTimeout(() => {
+            outputActivityTimer = null;
+            if (timedOut || outputActivityTimedOut) return;
+            outputActivityTimedOut = true;
+            clearTerminalCleanupTimers();
+            const elapsedMs = Date.now() - lastOutputActivityAt;
+            try {
+              outputActivityTimeout.onTimeout?.({
+                timeoutMs: outputActivityTimeout.timeoutMs,
+                elapsedMs,
+              });
+            } catch (err) {
+              onLogError(err, runId, "failed to report child output inactivity timeout");
+            }
+            signalRunningProcess({ child, processGroupId }, "SIGTERM");
+            outputActivityKillTimer = setTimeout(() => {
+              outputActivityKillTimer = null;
+              signalRunningProcess({ child, processGroupId }, "SIGKILL");
+            }, Math.max(1, outputActivityTimeout.graceMs ?? opts.graceSec * 1000));
+          }, outputActivityTimeout.timeoutMs);
+        };
+
+        const recordOutputActivity = (chunk: string) => {
+          if (!outputActivityTimeout || outputActivityTimedOut || timedOut) return;
+          let active = false;
+          try {
+            active = outputActivityTimeout.hasActivity({ chunk, stdout });
+          } catch (err) {
+            onLogError(err, runId, "failed to inspect child stdout activity");
+          }
+          if (!active) return;
+          lastOutputActivityAt = Date.now();
+          armOutputActivityTimer();
+        };
+
+        armOutputActivityTimer();
 
         const maybeArmTerminalResultCleanup = () => {
           const terminalCleanup = opts.terminalResultCleanup;
@@ -2017,6 +2082,7 @@ export async function runChildProcess(
             ? setTimeout(() => {
                 timedOut = true;
                 clearTerminalCleanupTimers();
+                clearOutputActivityTimers();
                 signalRunningProcess({ child, processGroupId }, "SIGTERM");
                 setTimeout(() => {
                   signalRunningProcess({ child, processGroupId }, "SIGKILL");
@@ -2030,6 +2096,7 @@ export async function runChildProcess(
           readable.pause();
           const text = String(chunk);
           stdout = appendWithCap(stdout, text);
+          recordOutputActivity(text);
           maybeArmTerminalResultCleanup();
           logChain = logChain
             .then(() => opts.onLog("stdout", text))
@@ -2068,6 +2135,7 @@ export async function runChildProcess(
         child.on("error", (err: Error) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
+          clearOutputActivityTimers();
           runningProcesses.delete(runId);
           void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
@@ -2086,6 +2154,7 @@ export async function runChildProcess(
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
+          clearOutputActivityTimers();
           runningProcesses.delete(runId);
           void logChain.finally(() => {
             void Promise.resolve()
@@ -2095,6 +2164,7 @@ export async function runChildProcess(
                 exitCode: code,
                 signal,
                 timedOut,
+                outputActivityTimedOut,
                 stdout,
                 stderr,
                 pid: child.pid ?? null,

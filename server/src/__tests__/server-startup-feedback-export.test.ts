@@ -17,9 +17,25 @@ const {
   fakeServer,
   loadConfigMock,
 } = vi.hoisted(() => {
+  const buildSelectQuery = () => {
+    const rows: Array<{ id: string }> = [];
+    const query = {
+      from: vi.fn(() => query),
+      where: vi.fn(() => Promise.resolve(rows)),
+      then: (onFulfilled?: (value: Array<{ id: string }>) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve(rows).then(onFulfilled, onRejected),
+    };
+    return query;
+  };
+  const buildDbMock = () => ({
+    select: vi.fn(() => buildSelectQuery()),
+    insert: vi.fn(() => ({
+      values: vi.fn(async () => undefined),
+    })),
+  });
   const createAppMock = vi.fn(async () => ((_: unknown, __: unknown) => {}) as never);
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
-  const createDbMock = vi.fn(() => ({}) as never);
+  const createDbMock = vi.fn(() => buildDbMock() as never);
   const detectPortMock = vi.fn(async (port: number) => port);
   const deriveAuthTrustedOriginsMock = vi.fn(() => []);
   const feedbackExportServiceMock = {
@@ -185,6 +201,10 @@ vi.mock("../startup-banner.js", () => ({
   printStartupBanner: vi.fn(),
 }));
 
+vi.mock("../adapters/registry.js", () => ({
+  waitForExternalAdapters: vi.fn(async () => undefined),
+}));
+
 vi.mock("../board-claim.js", () => ({
   getBoardClaimWarningUrl: vi.fn(() => null),
   initializeBoardClaimChallenge: vi.fn(async () => undefined),
@@ -337,6 +357,23 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
       expect.arrayContaining(["http://custom-api:3100"]),
     );
     expect(JSON.parse(process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON ?? "[]")[0]).toBe("http://custom-api:3100");
+  });
+
+  it("ignores inherited PAPERCLIP_API_URL in local_trusted mode", async () => {
+    loadConfigMock.mockReturnValueOnce(buildTestConfig({
+      deploymentMode: "local_trusted",
+      deploymentExposure: "private",
+    }));
+    process.env.PAPERCLIP_API_URL = "http://192.168.1.50:3100";
+
+    const started = await startServer();
+
+    expect(started.apiUrl).toBe("http://127.0.0.1:3210");
+    expect(process.env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3210");
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://127.0.0.1:3210");
+    const candidates = JSON.parse(process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON ?? "[]");
+    expect(candidates[0]).toBe("http://127.0.0.1:3210");
+    expect(candidates).not.toContain("http://192.168.1.50:3100");
   });
 
   it("falls back to host-based URL when PAPERCLIP_API_URL is not set", async () => {

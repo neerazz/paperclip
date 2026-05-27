@@ -258,6 +258,93 @@ describe("runChildProcess", () => {
     expect(finishedAt - startedAt).toBeGreaterThanOrEqual(spawnDelayMs);
   });
 
+  it.skipIf(process.platform === "win32")("kills a silent child after stdout activity stops", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        [
+          "process.stdout.write(`${JSON.stringify({ type: 'thread.started', thread_id: 'thread-1' })}\\n`);",
+          "setInterval(() => {}, 1000);",
+        ].join(" "),
+      ],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        onLog: async () => {},
+        outputActivityTimeout: {
+          timeoutMs: 100,
+          graceMs: 100,
+          hasActivity: ({ chunk }) => chunk.includes('"type":"thread.started"'),
+        },
+      },
+    );
+
+    expect(result.outputActivityTimedOut).toBe(true);
+    expect(result.timedOut).toBe(false);
+    expect(result.signal).toMatch(/SIGTERM|SIGKILL/);
+    expect(result.stdout).toContain('"thread_id":"thread-1"');
+  });
+
+  it.skipIf(process.platform === "win32")("keeps a child alive while stdout activity continues", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        [
+          "let count = 0;",
+          "const emitActivity = () => {",
+          "  count += 1;",
+          "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', count })}\\n`);",
+          "};",
+          "emitActivity();",
+          "const timer = setInterval(() => {",
+          "  emitActivity();",
+          "  if (count === 3) { clearInterval(timer); setTimeout(() => process.exit(0), 50); }",
+          "}, 50);",
+        ].join(" "),
+      ],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 2,
+        graceSec: 1,
+        onLog: async () => {},
+        outputActivityTimeout: {
+          timeoutMs: 250,
+          graceMs: 100,
+          hasActivity: ({ chunk }) => chunk.includes('"type":"item.completed"'),
+        },
+      },
+    );
+
+    expect(result.outputActivityTimedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.match(/item\.completed/g)?.length).toBe(3);
+  });
+
+  it.skipIf(process.platform === "win32")("does not arm stdout inactivity cleanup when no output activity timeout is configured", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "setTimeout(() => process.exit(0), 150);"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 1,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.outputActivityTimedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+  });
+
   it.skipIf(process.platform === "win32")("kills descendant processes on timeout via the process group", async () => {
     let descendantPid: number | null = null;
 

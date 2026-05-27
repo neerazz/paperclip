@@ -370,7 +370,6 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         and(
           eq(issueComments.companyId, companyId),
           eq(issueComments.issueId, issueId),
-          eq(issueComments.authorAgentId, agentId),
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
           issueRunScopeSql(issueId),
@@ -451,7 +450,6 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           and(
             eq(issueComments.companyId, sourceIssue.companyId),
             eq(issueComments.issueId, sourceIssue.id),
-            eq(issueComments.authorAgentId, sourceAgent.id),
             eq(heartbeatRuns.companyId, sourceIssue.companyId),
             eq(heartbeatRuns.agentId, sourceAgent.id),
             issueRunScopeSql(sourceIssue.id),
@@ -478,10 +476,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
     const highChurn =
-      runCountLastHour >= thresholds.highChurnHourly ||
-      assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
-      runCountLastSixHours >= thresholds.highChurnSixHours ||
-      assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
+      (runCountLastHour >= thresholds.highChurnHourly && assigneeRunCommentCountLastHour === 0) ||
+      (runCountLastSixHours >= thresholds.highChurnSixHours && assigneeRunCommentCountLastSixHours === 0);
     const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn });
     if (!trigger) return null;
 

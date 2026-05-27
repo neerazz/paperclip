@@ -205,7 +205,7 @@ describe("server adapter registry", () => {
     await expect(listAdapterModelProfiles("codex_local")).resolves.toEqual([
       expect.objectContaining({
         key: "cheap",
-        adapterConfig: expect.objectContaining({ model: "gpt-5.3-codex-spark" }),
+        adapterConfig: expect.objectContaining({ model: "gpt-5.4" }),
         source: "adapter_default",
       }),
     ]);
@@ -385,7 +385,7 @@ describe("server adapter registry", () => {
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
   });
 
-  it("passes the original Hermes context through when authToken is absent", async () => {
+  it("does not inject Hermes auth guidance when authToken is absent", async () => {
     const adapter = requireServerAdapter("hermes_local");
     const ctx = {
       runId: "run-123",
@@ -413,7 +413,11 @@ describe("server adapter registry", () => {
     await adapter.execute(ctx);
 
     expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
-    expect(hermesExecuteMock).toHaveBeenCalledWith(ctx);
+    const [patchedCtx] = hermesExecuteMock.mock.calls[0];
+    expect(patchedCtx.agent.adapterConfig).toBe(ctx.agent.adapterConfig);
+    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("server-level-key");
+    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_RUN_ID).toBeUndefined();
+    expect(patchedCtx.agent.adapterConfig.promptTemplate).toBe("Existing prompt");
   });
 
   it("preserves an explicit Hermes Paperclip API key and does not set promptTemplate when none was configured", async () => {
@@ -479,6 +483,149 @@ describe("server adapter registry", () => {
     expect(patchedCtx.agent.adapterConfig.promptTemplate).toBeUndefined();
     // Auth token is still injected.
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
+  });
+
+  it("drops Hermes session params unless a successful run emits an explicit stdout session_id line", async () => {
+    const adapter = requireServerAdapter("hermes_local");
+    hermesExecuteMock.mockImplementationOnce(async (ctx) => {
+      await ctx.onLog("stderr", "Use a session ID from `hermes sessions list` with --resume.\n");
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        sessionId: "from",
+        sessionParams: { sessionId: "from" },
+        sessionDisplayId: "from",
+        resultJson: {
+          result: "",
+          session_id: "from",
+        },
+      };
+    });
+
+    const result = await adapter.execute({
+      runId: "run-123",
+      agent: {
+        id: "agent-123",
+        companyId: "company-123",
+        name: "Hermes Agent",
+        role: "engineer",
+        adapterType: "hermes_local",
+        adapterConfig: {},
+      },
+      runtime: {},
+      config: {},
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+      authToken: "agent-run-jwt",
+    });
+
+    expect(result.sessionId).toBeNull();
+    expect(result.sessionParams).toBeNull();
+    expect(result.sessionDisplayId).toBeNull();
+    expect(result.resultJson?.session_id).toBeNull();
+  });
+
+  it("persists Hermes session params from a successful explicit stdout session_id line", async () => {
+    const adapter = requireServerAdapter("hermes_local");
+    hermesExecuteMock.mockImplementationOnce(async (ctx) => {
+      await ctx.onLog("stdout", "Done\nsession_id: 20260526_143052_a1b2c3\n");
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        sessionId: "legacy",
+        sessionParams: { sessionId: "legacy" },
+        sessionDisplayId: "legacy",
+        resultJson: {
+          result: "Done",
+          session_id: "legacy",
+        },
+      };
+    });
+
+    const result = await adapter.execute({
+      runId: "run-123",
+      agent: {
+        id: "agent-123",
+        companyId: "company-123",
+        name: "Hermes Agent",
+        role: "engineer",
+        adapterType: "hermes_local",
+        adapterConfig: {},
+      },
+      runtime: {},
+      config: {},
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+      authToken: "agent-run-jwt",
+    });
+
+    expect(result.sessionId).toBe("20260526_143052_a1b2c3");
+    expect(result.sessionParams).toEqual({ sessionId: "20260526_143052_a1b2c3" });
+    expect(result.sessionDisplayId).toBe("20260526_143052_");
+    expect(result.resultJson?.session_id).toBe("20260526_143052_a1b2c3");
+  });
+
+  it("passes Hermes a loopback runtime API URL and string-only env bindings", async () => {
+    const originalRuntimeApiUrl = process.env.PAPERCLIP_RUNTIME_API_URL;
+    const originalApiUrl = process.env.PAPERCLIP_API_URL;
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://127.0.0.1:3100";
+    process.env.PAPERCLIP_API_URL = "http://192.168.1.50:3100";
+
+    try {
+      const adapter = requireServerAdapter("hermes_local");
+
+      await adapter.execute({
+        runId: "run-123",
+        agent: {
+          id: "agent-123",
+          companyId: "company-123",
+          name: "Hermes Agent",
+          role: "engineer",
+          adapterType: "hermes_local",
+          adapterConfig: {
+            env: {
+              STRUCTURED_SECRET: { type: "secret_ref", secretId: "secret-1" },
+              RETRIES: 3,
+              ENABLED: true,
+              PAPERCLIP_API_KEY: { type: "secret_ref", secretId: "secret-api-key" },
+              PAPERCLIP_API_URL: "http://192.168.1.50:3100",
+            },
+          },
+        },
+        runtime: {},
+        config: {},
+        context: {},
+        onLog: async () => {},
+        onMeta: async () => {},
+        onSpawn: async () => {},
+        authToken: "agent-run-jwt",
+      });
+
+      const [patchedCtx] = hermesExecuteMock.mock.calls[0];
+      expect(patchedCtx.agent.adapterConfig.paperclipApiUrl).toBe("http://127.0.0.1:3100/api");
+      expect(patchedCtx.agent.adapterConfig.env).toMatchObject({
+        RETRIES: "3",
+        ENABLED: "true",
+        PAPERCLIP_API_KEY: "agent-run-jwt",
+        PAPERCLIP_API_URL: "http://127.0.0.1:3100",
+        PAPERCLIP_RUN_ID: "run-123",
+      });
+      expect(patchedCtx.agent.adapterConfig.env.STRUCTURED_SECRET).toBeUndefined();
+      expect(JSON.stringify(patchedCtx.agent.adapterConfig.env)).not.toContain("[object Object]");
+      expect(JSON.stringify(patchedCtx.agent.adapterConfig)).not.toContain("192.168.1.50");
+    } finally {
+      if (originalRuntimeApiUrl === undefined) delete process.env.PAPERCLIP_RUNTIME_API_URL;
+      else process.env.PAPERCLIP_RUNTIME_API_URL = originalRuntimeApiUrl;
+
+      if (originalApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
+      else process.env.PAPERCLIP_API_URL = originalApiUrl;
+    }
   });
 });
 

@@ -120,20 +120,24 @@ describeEmbeddedPostgres("productivity review service", () => {
     count: number;
     now: Date;
     withRunComments?: boolean;
+    runCommentAuthorAgentId?: string | null;
+    runCommentAuthorUserId?: string | null;
+    status?: "succeeded" | "running";
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
       const runId = randomUUID();
       const createdAt = new Date(input.now.getTime() - index * 60_000);
+      const status = input.status ?? "succeeded";
       runs.push({
         id: runId,
         companyId: input.companyId,
         agentId: input.agentId,
-        status: "succeeded",
+        status,
         invocationSource: "assignment",
         triggerDetail: "system",
         startedAt: createdAt,
-        finishedAt: new Date(createdAt.getTime() + 30_000),
+        finishedAt: status === "succeeded" ? new Date(createdAt.getTime() + 30_000) : null,
         contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
         livenessState: "advanced",
         nextAction: "Continue processing the next batch.",
@@ -148,7 +152,8 @@ describeEmbeddedPostgres("productivity review service", () => {
         runs.map((run, index) => ({
           companyId: input.companyId,
           issueId: input.issueId,
-          authorAgentId: input.agentId,
+          authorAgentId: input.runCommentAuthorAgentId === undefined ? input.agentId : input.runCommentAuthorAgentId,
+          authorUserId: input.runCommentAuthorUserId,
           createdByRunId: run.id,
           body: `Progress update ${index}`,
           createdAt: run.createdAt as Date,
@@ -360,7 +365,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(hold.held).toBe(false);
   });
 
-  it("creates a high-churn review even when every sampled run has a progress comment", async () => {
+  it("creates a high-churn review for rapid active runs without assignee progress comments", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
     await insertRuns({
@@ -369,7 +374,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       issueId: seeded.issueId,
       count: 10,
       now,
-      withRunComments: true,
+      status: "running",
     });
 
     const result = await productivityReviewService(db).reconcileProductivityReviews({
@@ -381,6 +386,29 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `high_churn`");
     expect(review?.description).toContain("Runs in rolling windows: 10/1h");
+  });
+
+  it("does not open a high-churn review for assignee runs with local-board run-linked comments", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+      runCommentAuthorAgentId: null,
+      runCommentAuthorUserId: "local-board",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
   it("ignores non-assignee comments when evaluating high-churn productivity reviews", async () => {

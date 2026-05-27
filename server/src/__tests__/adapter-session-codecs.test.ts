@@ -41,16 +41,19 @@ describe("adapter session codecs", () => {
     const parsed = codexSessionCodec.deserialize({
       sessionId: "codex-session-1",
       cwd: "/tmp/codex",
+      model: "gpt-5.4",
     });
     expect(parsed).toEqual({
       sessionId: "codex-session-1",
       cwd: "/tmp/codex",
+      model: "gpt-5.4",
     });
 
     const serialized = codexSessionCodec.serialize(parsed);
     expect(serialized).toEqual({
       sessionId: "codex-session-1",
       cwd: "/tmp/codex",
+      model: "gpt-5.4",
     });
     expect(codexSessionCodec.getDisplayId?.(serialized ?? null)).toBe("codex-session-1");
   });

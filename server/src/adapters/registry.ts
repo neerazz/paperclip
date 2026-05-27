@@ -212,6 +212,103 @@ function normalizeHermesConfig<T extends { config?: unknown; agent?: unknown }>(
   return ctx;
 }
 
+function readHermesExplicitSessionId(stdout: string): string | null {
+  const match = stdout.match(/^session_id:\s*([A-Za-z0-9][A-Za-z0-9_-]{2,})\s*$/m);
+  return match?.[1] ?? null;
+}
+
+function isHermesRunSuccessful(result: Awaited<ReturnType<ServerAdapterModule["execute"]>>): boolean {
+  return !result.timedOut && (result.exitCode ?? 0) === 0 && !result.errorMessage;
+}
+
+function normalizePaperclipApiBaseUrl(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/\/api\/?$/i, "").replace(/\/+$/, "");
+}
+
+function withApiPath(value: string): string {
+  return `${normalizePaperclipApiBaseUrl(value) ?? value.replace(/\/+$/, "")}/api`;
+}
+
+function resolveHermesPaperclipApiBaseUrl(): string | null {
+  return normalizePaperclipApiBaseUrl(
+    process.env.PAPERCLIP_RUNTIME_API_URL ??
+      process.env.PAPERCLIP_API_URL ??
+      null,
+  );
+}
+
+function sanitizeHermesEnv(env: unknown): Record<string, string> {
+  if (!env || typeof env !== "object" || Array.isArray(env)) return {};
+  const sanitized: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === "string") {
+      sanitized[key] = value;
+    } else if (typeof value === "number" || typeof value === "boolean") {
+      sanitized[key] = String(value);
+    }
+  }
+  return sanitized;
+}
+
+function sanitizeHermesSessionResult(
+  result: Awaited<ReturnType<ServerAdapterModule["execute"]>>,
+  observedStdout: string,
+): Awaited<ReturnType<ServerAdapterModule["execute"]>> {
+  const explicitSessionId = readHermesExplicitSessionId(observedStdout);
+  const hasSessionFields =
+    result.sessionId !== undefined ||
+    result.sessionParams !== undefined ||
+    result.sessionDisplayId !== undefined;
+  const hasResultJsonSessionId =
+    result.resultJson &&
+    typeof result.resultJson === "object" &&
+    Object.prototype.hasOwnProperty.call(result.resultJson, "session_id");
+
+  if (!hasSessionFields && !hasResultJsonSessionId) return result;
+
+  if (!isHermesRunSuccessful(result) || !explicitSessionId) {
+    return {
+      ...result,
+      ...(hasSessionFields
+        ? {
+            sessionId: null,
+            sessionParams: null,
+            sessionDisplayId: null,
+          }
+        : {}),
+      ...(hasResultJsonSessionId
+        ? {
+            resultJson: {
+              ...(result.resultJson ?? {}),
+              session_id: null,
+            },
+          }
+        : {}),
+    };
+  }
+
+  return {
+    ...result,
+    ...(hasSessionFields
+      ? {
+          sessionId: explicitSessionId,
+          sessionParams: { sessionId: explicitSessionId },
+          sessionDisplayId: explicitSessionId.slice(0, 16),
+        }
+      : {}),
+    ...(hasResultJsonSessionId
+      ? {
+          resultJson: {
+            ...(result.resultJson ?? {}),
+            session_id: explicitSessionId,
+          },
+        }
+      : {}),
+  };
+}
+
 function dedupeAdapterModels(models: AdapterModel[]): AdapterModel[] {
   const seen = new Set<string>();
   const result: AdapterModel[] = [];
@@ -439,15 +536,27 @@ const hermesLocalAdapter: ServerAdapterModule = {
   type: "hermes_local",
   execute: async (ctx) => {
     const normalizedCtx = normalizeHermesConfig(ctx);
-    if (!normalizedCtx.authToken) return executeHermesLocal(normalizedCtx);
+    const runHermesWithSessionGuard = async (guardedCtx: typeof normalizedCtx) => {
+      let observedStdout = "";
+      const observedCtx = {
+        ...guardedCtx,
+        onLog: async (stream: "stdout" | "stderr", chunk: string) => {
+          if (stream === "stdout") observedStdout += chunk;
+          return guardedCtx.onLog(stream, chunk);
+        },
+      };
+
+      const result = await executeHermesLocal(observedCtx);
+      return sanitizeHermesSessionResult(result, observedStdout);
+    };
+
+    if (!normalizedCtx.authToken) return runHermesWithSessionGuard(normalizedCtx);
 
     const existingConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;
-    const existingEnv =
-      typeof existingConfig.env === "object" && existingConfig.env !== null && !Array.isArray(existingConfig.env)
-        ? (existingConfig.env as Record<string, string>)
-        : {};
+    const existingEnv = sanitizeHermesEnv(existingConfig.env);
     const explicitApiKey =
       typeof existingEnv.PAPERCLIP_API_KEY === "string" && existingEnv.PAPERCLIP_API_KEY.trim().length > 0;
+    const paperclipApiBaseUrl = resolveHermesPaperclipApiBaseUrl();
     const promptTemplate =
       typeof existingConfig.promptTemplate === "string" && existingConfig.promptTemplate.trim().length > 0
         ? existingConfig.promptTemplate
@@ -464,8 +573,10 @@ const hermesLocalAdapter: ServerAdapterModule = {
       env: {
         ...existingEnv,
         ...(!explicitApiKey ? { PAPERCLIP_API_KEY: normalizedCtx.authToken } : {}),
+        ...(paperclipApiBaseUrl ? { PAPERCLIP_API_URL: paperclipApiBaseUrl } : {}),
         PAPERCLIP_RUN_ID: normalizedCtx.runId,
       },
+      ...(paperclipApiBaseUrl ? { paperclipApiUrl: withApiPath(paperclipApiBaseUrl) } : {}),
     };
 
     // Only inject the auth guard into promptTemplate when a custom template already exists.
@@ -483,7 +594,7 @@ const hermesLocalAdapter: ServerAdapterModule = {
       },
     };
 
-    return executeHermesLocal(patchedCtx);
+    return runHermesWithSessionGuard(patchedCtx);
   },
   testEnvironment: (ctx) => hermesTestEnvironment(normalizeHermesConfig(ctx) as never),
   sessionCodec: hermesSessionCodec,

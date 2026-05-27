@@ -125,6 +125,9 @@ export const queryKeys = {
   auth: {
     session: ["auth", "session"] as const,
   },
+  filesystem: {
+    list: (path: string) => ["filesystem", "list", path] as const,
+  },
   sidebarPreferences: {
     companyOrder: (userId: string) => ["sidebar-preferences", "company-order", userId] as const,
     projectOrder: (companyId: string, userId: string) =>

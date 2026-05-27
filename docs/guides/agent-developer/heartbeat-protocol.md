@@ -119,8 +119,8 @@ Always set `parentId` and `goalId` on subtasks.
 Paperclip records run liveness as metadata on heartbeat runs. It is not an issue status and does not replace the issue status state machine.
 
 - Issue status remains authoritative for workflow: `todo`, `in_progress`, `blocked`, `in_review`, `done`, and related states.
-- Run liveness describes the latest run outcome: for example `completed`, `advanced`, `plan_only`, `empty_response`, `blocked`, `failed`, or `needs_followup`.
-- Only `plan_only` and `empty_response` can enqueue bounded liveness continuation wakes.
+- Run liveness describes the latest run outcome: for example `completed`, `advanced`, `plan_only`, `runnable_no_evidence`, `empty_response`, `blocked`, `failed`, or `needs_followup`.
+- Only `plan_only`, `runnable_no_evidence`, and `empty_response` can enqueue bounded liveness continuation wakes.
 - Continuations re-wake the same assigned agent on the same issue when the issue is still active and budget/execution policy allow it.
 - `continuationAttempt` counts semantic liveness continuations for a source run chain. It is separate from process recovery, queued wake delivery, adapter session resume, and other operational retries.
 - Liveness continuation wake prompts include the attempt, source run, liveness state, liveness reason, and the instruction for the next heartbeat.

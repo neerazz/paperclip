@@ -157,6 +157,18 @@ export type CompanyUserDirectoryResponse = {
   users: CompanyUserDirectoryEntry[];
 };
 
+export type FilesystemListEntry = {
+  name: string;
+  isDir: boolean;
+  isSymlink: boolean;
+};
+
+export type FilesystemListResponse = {
+  path: string;
+  parent: string | null;
+  entries: FilesystemListEntry[];
+};
+
 export type CompanyInviteRecord = {
   id: string;
   companyId: string | null;
@@ -321,6 +333,12 @@ export const accessApi = {
 
   listUserDirectory: (companyId: string) =>
     api.get<CompanyUserDirectoryResponse>(`/companies/${companyId}/user-directory`),
+
+  listFilesystem: (path?: string | null) => {
+    const nextPath = path?.trim();
+    const query = nextPath ? `?path=${encodeURIComponent(nextPath)}` : "";
+    return api.get<FilesystemListResponse>(`/filesystem/list${query}`);
+  },
 
   updateMember: (
     companyId: string,

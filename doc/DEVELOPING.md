@@ -217,6 +217,8 @@ For `codex_local`, Paperclip also manages a per-company Codex home under the ins
 
 - `~/.paperclip/instances/default/companies/<company-id>/codex-home`
 
+In `local_trusted` mode, Paperclip injects local CLI/session heartbeat runs, including `hermes_local`, with a loopback `PAPERCLIP_API_URL` for the active server port, such as `http://127.0.0.1:3100`. An inherited shell `PAPERCLIP_API_URL` is ignored for these local-trusted runs so checkout, comment, and issue-update calls target the reachable local server. Use authenticated mode plus `PAPERCLIP_AUTH_PUBLIC_BASE_URL` when agents must call a non-loopback/public Paperclip URL.
+
 If the `codex` CLI is not installed or not on `PATH`, `codex_local` agent runs fail at execution time with a clear adapter error. Quota polling uses a short-lived `codex app-server` subprocess: when `codex` cannot be spawned, that provider reports `ok: false` in aggregated quota results and the API server keeps running (it must not exit on a missing binary).
 
 Local adapters require their corresponding CLI/session setup on the machine running Paperclip. External adapters are installed through the adapter/plugin flow and should not require hardcoded imports in `server/` or `ui/`.

@@ -124,6 +124,22 @@ async function createApp() {
   return app;
 }
 
+async function createAppWithActor(actor: Record<string, unknown>) {
+  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
+    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
+    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+  ]);
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    (req as any).actor = actor;
+    next();
+  });
+  app.use("/api", issueRoutes({} as any, {} as any));
+  app.use(errorHandler);
+  return app;
+}
+
 function makeIssue(input: {
   id: string;
   title: string;
@@ -325,5 +341,43 @@ describe("assigned backlog creation contract", () => {
       }),
     );
     expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("skips assignment wakeup when an agent creates work assigned to itself from an active run", async () => {
+    const selfAgentId = assigneeAgentId;
+    const res = await request(await createAppWithActor({
+      type: "agent",
+      agentId: selfAgentId,
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-self-create-1",
+    }))
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Self assigned work",
+        assigneeAgentId: selfAgentId,
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        title: "Self assigned work",
+        assigneeAgentId: selfAgentId,
+        status: "todo",
+        createdByAgentId: selfAgentId,
+      }),
+    );
+    expect(mockWakeup).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.created",
+        details: expect.objectContaining({
+          assignmentWakeSkipped: true,
+          assignmentWakeSkipReason: "self_assignment_in_active_run",
+        }),
+      }),
+    );
   });
 });

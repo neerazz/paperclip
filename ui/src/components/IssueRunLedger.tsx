@@ -87,6 +87,11 @@ const LIVENESS_COPY: Record<RunLivenessState, LivenessCopy> = {
     tone: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
     description: "Run described future work without concrete action evidence.",
   },
+  runnable_no_evidence: {
+    label: "Runnable no evidence",
+    tone: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+    description: "Run described runnable work but did not prove concrete progress.",
+  },
   empty_response: {
     label: "Empty response",
     tone: "border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-300",
@@ -336,7 +341,11 @@ function lastUsefulActionLabel(run: LedgerRun) {
   if (run.status === "scheduled_retry") return "Waiting for next attempt";
   if (run.lastUsefulActionAt) return relativeTime(run.lastUsefulActionAt);
   if (isActiveRun(run)) return "No action recorded yet";
-  if (run.livenessState === "plan_only" || run.livenessState === "needs_followup") {
+  if (
+    run.livenessState === "plan_only" ||
+    run.livenessState === "runnable_no_evidence" ||
+    run.livenessState === "needs_followup"
+  ) {
     return "No concrete action";
   }
   if (run.livenessState === "empty_response") return "No useful output";

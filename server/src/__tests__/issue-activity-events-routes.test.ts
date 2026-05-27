@@ -44,6 +44,7 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
 const mockRoutineService = vi.hoisted(() => ({
   syncRunStatusForIssue: vi.fn(async () => undefined),
 }));
+const mockHasActiveRoutineBackedContinuationPath = vi.hoisted(() => vi.fn(async () => false));
 
 function registerModuleMocks() {
   vi.doMock("../services/access.js", () => ({
@@ -72,6 +73,10 @@ function registerModuleMocks() {
 
   vi.doMock("../services/routines.js", () => ({
     routineService: () => mockRoutineService,
+  }));
+
+  vi.doMock("../services/issue-continuation-paths.js", () => ({
+    hasActiveRoutineBackedContinuationPath: mockHasActiveRoutineBackedContinuationPath,
   }));
 
   vi.doMock("../services/index.js", () => ({
@@ -174,6 +179,12 @@ describe("issue activity event routes", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-1",
+      body: "comment",
+      metadata: null,
+      presentation: null,
+    });
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
@@ -200,6 +211,7 @@ describe("issue activity event routes", () => {
     });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
     mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
+    mockHasActiveRoutineBackedContinuationPath.mockResolvedValue(false);
   });
 
   it("logs blocker activity with added and removed issue summaries", async () => {
@@ -393,6 +405,112 @@ describe("issue activity event routes", () => {
             sourceRunId: "run-1",
             correctiveRunId: "run-2",
             resolvedByStatus: "done",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("logs successful_run_handoff_resolved when an in_progress comment reaffirms a routine-backed continuation path", async () => {
+    const issue = { ...makeIssue(), status: "in_progress" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockHasActiveRoutineBackedContinuationPath.mockResolvedValue(true);
+
+    const handoffActivityRow = {
+      entityId: issue.id,
+      action: "issue.successful_run_handoff_required",
+      agentId: issue.assigneeAgentId,
+      runId: "run-1",
+      details: {
+        sourceRunId: "run-1",
+        correctiveRunId: "run-2",
+      },
+      createdAt: new Date("2026-05-01T00:00:00.000Z"),
+    };
+    const dbMock = {
+      select: () => ({
+        from: () => ({
+          where: () => ({
+            orderBy: async () => [handoffActivityRow],
+          }),
+        }),
+      }),
+    };
+
+    const res = await request(await createApp(dbMock))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_progress", comment: "Routine remains active; keeping the parent in progress." });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.successful_run_handoff_resolved",
+          entityId: issue.id,
+          details: expect.objectContaining({
+            identifier: "PAP-580",
+            sourceRunId: "run-1",
+            correctiveRunId: "run-2",
+            resolvedByContinuationPath: "routine",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("logs successful_run_handoff_resolved when an escalated handoff comment reaffirms a routine-backed continuation path", async () => {
+    const issue = { ...makeIssue(), status: "in_progress" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockHasActiveRoutineBackedContinuationPath.mockResolvedValue(true);
+
+    const handoffActivityRow = {
+      entityId: issue.id,
+      action: "issue.successful_run_handoff_escalated",
+      agentId: issue.assigneeAgentId,
+      runId: "run-2",
+      details: {
+        sourceRunId: "run-1",
+        correctiveRunId: "run-2",
+      },
+      createdAt: new Date("2026-05-01T00:00:00.000Z"),
+    };
+    const dbMock = {
+      select: () => ({
+        from: () => ({
+          where: () => ({
+            orderBy: async () => [handoffActivityRow],
+          }),
+        }),
+      }),
+    };
+
+    const res = await request(await createApp(dbMock))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_progress", comment: "Routine remains active after the escalated handoff." });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.successful_run_handoff_resolved",
+          entityId: issue.id,
+          details: expect.objectContaining({
+            identifier: "PAP-580",
+            sourceRunId: "run-1",
+            correctiveRunId: "run-2",
+            resolvedByContinuationPath: "routine",
           }),
         }),
       );

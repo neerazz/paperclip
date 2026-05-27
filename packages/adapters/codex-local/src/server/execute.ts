@@ -23,6 +23,7 @@ import {
   asString,
   asNumber,
   parseObject,
+  parseJson,
   buildPaperclipEnv,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
@@ -52,6 +53,8 @@ import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const CODEX_ROLLOUT_NOISE_RE =
   /^\d{4}-\d{2}-\d{2}T[^\s]+\s+ERROR\s+codex_core::rollout::list:\s+state db missing rollout path for thread\s+[a-z0-9-]+$/i;
+const DEFAULT_CODEX_OUTPUT_INACTIVITY_TIMEOUT_MS = 7 * 60_000;
+const CODEX_OUTPUT_INACTIVITY_GRACE_MS = 5_000;
 
 function stripCodexRolloutNoise(text: string): string {
   const parts = text.split(/\r?\n/);
@@ -198,6 +201,28 @@ function fallbackModeUsesFreshSession(mode: CodexTransientFallbackMode | null): 
   return mode === "fresh_session" || mode === "fresh_session_safer_invocation";
 }
 
+function resolveCodexOutputInactivityTimeoutMs(config: Record<string, unknown>): number | null {
+  if (config.outputInactivityTimeoutMs === null) return null;
+  const configured = asNumber(config.outputInactivityTimeoutMs, DEFAULT_CODEX_OUTPUT_INACTIVITY_TIMEOUT_MS);
+  return configured > 0 ? configured : DEFAULT_CODEX_OUTPUT_INACTIVITY_TIMEOUT_MS;
+}
+
+function formatDurationMs(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds}s`;
+}
+
+function chunkHasCodexJsonEvent(chunk: string): boolean {
+  for (const rawLine of chunk.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (parseJson(line)) return true;
+  }
+  return false;
+}
+
 function buildCodexTransientHandoffNote(input: {
   previousSessionId: string | null;
   fallbackMode: CodexTransientFallbackMode;
@@ -291,6 +316,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const command = asString(config.command, "codex");
   const model = asString(config.model, "");
+  const outputInactivityTimeoutMs = resolveCodexOutputInactivityTimeoutMs(config);
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
@@ -532,16 +558,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
   const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
+  const runtimeSessionModel = asString(runtimeSessionParams.model, "");
   const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
+  const hasConfiguredModel = model.trim().length > 0;
+  const hasMatchingConfiguredModel =
+    !hasConfiguredModel || (runtimeSessionModel.length > 0 && runtimeSessionModel === model.trim());
   const canResumeSession =
     runtimeSessionId.length > 0 &&
+    hasMatchingConfiguredModel &&
     (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
   const codexTransientFallbackMode = readCodexTransientFallbackMode(context);
   const forceSaferInvocation = fallbackModeUsesSaferInvocation(codexTransientFallbackMode);
   const forceFreshSession = fallbackModeUsesFreshSession(codexTransientFallbackMode);
   const sessionId = canResumeSession && !forceFreshSession ? runtimeSessionId : null;
-  if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
+  if (runtimeSessionId && hasConfiguredModel && !hasMatchingConfiguredModel) {
+    const modelReason =
+      runtimeSessionModel.length > 0
+        ? `model "${runtimeSessionModel}"`
+        : "missing model metadata";
+    await onLog(
+      "stdout",
+      `[paperclip] Codex session "${runtimeSessionId}" was saved with ${modelReason} and will not be resumed with configured model "${model.trim()}". Starting a fresh session.\n`,
+    );
+  } else if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
     await onLog(
       "stdout",
       `[paperclip] Codex session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
@@ -676,6 +716,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     sessionHandoffChars: sessionHandoffNote.length,
     heartbeatPromptChars: renderedPrompt.length,
   };
+  if (outputInactivityTimeoutMs === null) {
+    await onLog(
+      "stdout",
+      "[paperclip] Warning: Codex output inactivity watchdog disabled by adapterConfig.outputInactivityTimeoutMs=null.\n",
+    );
+  }
+  let outputInactivityErrorMessage: string | null = null;
 
   const runAttempt = async (resumeSessionId: string | null) => {
     const execArgs = buildCodexExecArgs(
@@ -714,6 +761,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timeoutSec,
       graceSec,
       onSpawn,
+      ...(outputInactivityTimeoutMs === null
+        ? {}
+        : {
+            outputActivityTimeout: {
+              timeoutMs: outputInactivityTimeoutMs,
+              graceMs: CODEX_OUTPUT_INACTIVITY_GRACE_MS,
+              hasActivity: ({ chunk }) => chunkHasCodexJsonEvent(chunk),
+              onTimeout: ({ timeoutMs, elapsedMs }) => {
+                outputInactivityErrorMessage = `watchdog: no codex output for ${formatDurationMs(elapsedMs)}`;
+                void onLog(
+                  "stdout",
+                  `[paperclip] ${JSON.stringify({
+                    event: "adapter.invoke.output_inactivity_timeout",
+                    adapterType: "codex_local",
+                    timeoutMs,
+                    elapsedMs,
+                  })}\n`,
+                );
+              },
+            },
+          }),
       onLog: async (stream, chunk) => {
         if (stream !== "stderr") {
           await onLog(stream, chunk);
@@ -736,10 +804,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   const toResult = (
-    attempt: { proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string }; rawStderr: string; parsed: ReturnType<typeof parseCodexJsonl> },
+    attempt: { proc: { exitCode: number | null; signal: string | null; timedOut: boolean; outputActivityTimedOut?: boolean; stdout: string; stderr: string }; rawStderr: string; parsed: ReturnType<typeof parseCodexJsonl> },
     clearSessionOnMissingSession = false,
     isRetry = false,
   ): AdapterExecutionResult => {
+    if (attempt.proc.outputActivityTimedOut) {
+      return {
+        exitCode: attempt.proc.exitCode,
+        signal: attempt.proc.signal,
+        timedOut: false,
+        errorMessage:
+          outputInactivityErrorMessage ??
+          `watchdog: no codex output for ${formatDurationMs(outputInactivityTimeoutMs ?? 0)}`,
+        clearSession: clearSessionOnMissingSession,
+      };
+    }
+
     if (attempt.proc.timedOut) {
       return {
         exitCode: attempt.proc.exitCode,
@@ -754,10 +834,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const resolvedSessionId =
       attempt.parsed.sessionId ??
       (canFallbackToRuntimeSession ? (runtimeSessionId ?? runtime.sessionId ?? null) : null);
+    const resolvedModel = model.trim() || null;
     const resolvedSessionParams = resolvedSessionId
       ? ({
         sessionId: resolvedSessionId,
         cwd: effectiveExecutionCwd,
+        ...(resolvedModel ? { model: resolvedModel } : {}),
         ...(executionTargetIsRemote
           ? {
               remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
@@ -810,7 +892,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionDisplayId: resolvedSessionId,
       provider: "openai",
       biller: resolveCodexBiller(effectiveEnv, billingType),
-      model,
+      model: resolvedModel,
       billingType,
       costUsd: null,
       resultJson: {

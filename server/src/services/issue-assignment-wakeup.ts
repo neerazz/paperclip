@@ -18,6 +18,39 @@ export interface IssueAssignmentWakeupDeps {
   ) => Promise<unknown>;
 }
 
+type IssueAssignmentWakeDecisionInput = {
+  issue: { assigneeAgentId: string | null; status: string };
+  requestedByActorType?: "user" | "agent" | "system";
+  requestedByActorId?: string | null;
+  requestedByRunId?: string | null;
+};
+
+type IssueAssignmentWakeSkipReason =
+  | "no_agent_assignee"
+  | "assigned_backlog"
+  | "self_assignment_in_active_run";
+
+export function describeIssueAssignmentWakeup(input: IssueAssignmentWakeDecisionInput): {
+  shouldWake: boolean;
+  skipReason: IssueAssignmentWakeSkipReason | null;
+} {
+  if (!input.issue.assigneeAgentId) {
+    return { shouldWake: false, skipReason: "no_agent_assignee" };
+  }
+  if (input.issue.status === "backlog") {
+    return { shouldWake: false, skipReason: "assigned_backlog" };
+  }
+  if (
+    input.requestedByActorType === "agent" &&
+    input.requestedByRunId &&
+    input.requestedByActorId &&
+    input.requestedByActorId === input.issue.assigneeAgentId
+  ) {
+    return { shouldWake: false, skipReason: "self_assignment_in_active_run" };
+  }
+  return { shouldWake: true, skipReason: null };
+}
+
 export function queueIssueAssignmentWakeup(input: {
   heartbeat: IssueAssignmentWakeupDeps;
   issue: { id: string; assigneeAgentId: string | null; status: string };
@@ -26,12 +59,19 @@ export function queueIssueAssignmentWakeup(input: {
   contextSource: string;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
+  requestedByRunId?: string | null;
   rethrowOnError?: boolean;
 }) {
-  if (!input.issue.assigneeAgentId || input.issue.status === "backlog") return;
+  const decision = describeIssueAssignmentWakeup({
+    issue: input.issue,
+    requestedByActorType: input.requestedByActorType,
+    requestedByActorId: input.requestedByActorId,
+    requestedByRunId: input.requestedByRunId,
+  });
+  if (!decision.shouldWake) return;
 
   return input.heartbeat
-    .wakeup(input.issue.assigneeAgentId, {
+    .wakeup(input.issue.assigneeAgentId!, {
       source: "assignment",
       triggerDetail: "system",
       reason: input.reason,

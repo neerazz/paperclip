@@ -671,7 +671,11 @@ export async function startServer(): Promise<StartedServer> {
     bindHost: runtimeListenHost,
     port: listenPort,
   });
-  const configuredApiUrl = process.env.PAPERCLIP_API_URL?.trim() || runtimeApiUrl;
+  const inheritedApiUrl = process.env.PAPERCLIP_API_URL?.trim() || "";
+  const configuredApiUrl =
+    config.deploymentMode === "local_trusted"
+      ? runtimeApiUrl
+      : inheritedApiUrl || runtimeApiUrl;
   const runtimeApiCandidates = buildRuntimeApiCandidateUrls({
     preferredApiUrl: configuredApiUrl,
     authPublicBaseUrl: config.authPublicBaseUrl ?? null,

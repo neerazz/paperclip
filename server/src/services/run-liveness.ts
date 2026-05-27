@@ -341,6 +341,13 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
   }
 
   if (usefulOutput) {
+    if (actionability === "runnable") {
+      return output(
+        "runnable_no_evidence",
+        "Run described runnable work but produced no concrete action evidence",
+        nextAction,
+      );
+    }
     return output("needs_followup", "Run produced useful output but no concrete action evidence", nextAction);
   }
 

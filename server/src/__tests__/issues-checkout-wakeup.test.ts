@@ -24,7 +24,7 @@ describe("shouldWakeAssigneeOnCheckout", () => {
     ).toBe(false);
   });
 
-  it("still wakes when checkout run id is missing", () => {
+  it("skips wakeup for agent self-checkout even when checkout run id is missing", () => {
     expect(
       shouldWakeAssigneeOnCheckout({
         actorType: "agent",
@@ -32,7 +32,7 @@ describe("shouldWakeAssigneeOnCheckout", () => {
         checkoutAgentId: "agent-1",
         checkoutRunId: null,
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("still wakes when agent checks out on behalf of another agent id", () => {

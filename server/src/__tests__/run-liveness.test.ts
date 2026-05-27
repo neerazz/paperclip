@@ -195,6 +195,18 @@ describe("run liveness classifier", () => {
     expect(classification.nextAction).toBe("deploy to production and verify live traffic.");
   });
 
+  it("classifies runnable useful output without durable evidence as runnable_no_evidence", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      resultJson: {
+        summary: "Inspected the backend flow and can run pnpm test to verify the detector.",
+      },
+    });
+
+    expect(classification.livenessState).toBe("runnable_no_evidence");
+    expect(classification.actionability).toBe("runnable");
+  });
+
   it("marks unclear useful output as unknown actionability", () => {
     const classification = classifyRunLiveness({
       ...baseInput,

@@ -172,6 +172,7 @@ describe("IssueRunLedger", () => {
     const states: RunLivenessState[] = [
       "advanced",
       "plan_only",
+      "runnable_no_evidence",
       "empty_response",
       "blocked",
       "failed",
@@ -195,6 +196,7 @@ describe("IssueRunLedger", () => {
 
     expect(container.textContent).toContain("Advanced");
     expect(container.textContent).toContain("Plan only");
+    expect(container.textContent).toContain("Runnable no evidence");
     expect(container.textContent).toContain("Empty response");
     expect(container.textContent).toContain("Blocked");
     expect(container.textContent).toContain("Failed");

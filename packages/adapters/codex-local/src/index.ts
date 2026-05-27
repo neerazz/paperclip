@@ -49,10 +49,10 @@ export const modelProfiles: AdapterModelProfileDefinition[] = [
   {
     key: "cheap",
     label: "Cheap",
-    description: "Use the lowest-cost known Codex local model lane without changing the primary model.",
+    description: "Use the default supported Codex local recovery lane without changing the primary model.",
     adapterConfig: {
-      model: "gpt-5.3-codex-spark",
-      // Spark is the cheap lane by model price; high effort keeps Codex coding behavior usable for delegated work.
+      // Keep the recovery profile on a supported model; stale spark selections fail hard at runtime.
+      model: "gpt-5.4",
       modelReasoningEffort: "high",
     },
     source: "adapter_default",
@@ -81,6 +81,7 @@ Core fields:
 Operational fields:
 - timeoutSec (number, optional): run timeout in seconds
 - graceSec (number, optional): SIGTERM grace period in seconds
+- outputInactivityTimeoutMs (number|null, optional): Codex JSON stdout inactivity watchdog in milliseconds; defaults to 420000, <=0 uses default, null disables with a warning
 
 Notes:
 - Prompts are piped via stdin (Codex receives "-" prompt argument).

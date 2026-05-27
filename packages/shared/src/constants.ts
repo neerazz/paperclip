@@ -602,6 +602,7 @@ export const RUN_LIVENESS_STATES = [
   "completed",
   "advanced",
   "plan_only",
+  "runnable_no_evidence",
   "empty_response",
   "blocked",
   "failed",

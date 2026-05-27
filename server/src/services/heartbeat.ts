@@ -115,6 +115,7 @@ import {
   getIssueContinuationSummaryDocument,
   refreshIssueContinuationSummary,
 } from "./issue-continuation-summary.js";
+import { hasActiveRoutineBackedContinuationPath } from "./issue-continuation-paths.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
@@ -4013,7 +4014,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function handleRunLivenessContinuation(run: typeof heartbeatRuns.$inferSelect) {
     const livenessState = run.livenessState as RunLivenessState | null;
-    if (livenessState !== "plan_only" && livenessState !== "empty_response") return;
+    if (
+      livenessState !== "plan_only" &&
+      livenessState !== "runnable_no_evidence" &&
+      livenessState !== "empty_response"
+    ) return;
 
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId);
@@ -4227,6 +4232,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const [
       activeExecutionPath,
+      activeRoutineBackedContinuation,
       queuedWake,
       pendingInteraction,
       pendingApproval,
@@ -4255,6 +4261,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .limit(1)
           .then((rows) => rows[0] ?? null)
         : Promise.resolve(null),
+      issue
+        ? hasActiveRoutineBackedContinuationPath(db, {
+          companyId: issue.companyId,
+          issueId: issue.id,
+        })
+        : Promise.resolve(false),
       issue
         ? db
           .select({ id: agentWakeupRequests.id })
@@ -4369,7 +4381,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       livenessState: run.livenessState as RunLivenessState | null,
       detectedProgressSummary,
       taskKey,
-      hasActiveExecutionPath: Boolean(activeExecutionPath),
+      hasActiveExecutionPath: Boolean(activeExecutionPath || activeRoutineBackedContinuation),
       hasQueuedWake: Boolean(queuedWake),
       hasPendingInteractionOrApproval: Boolean(pendingInteraction || pendingApproval),
       hasExplicitBlockerPath: Boolean(explicitBlocker),
@@ -4552,6 +4564,135 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  async function findLatestRunIssueComment(runId: string, companyId: string) {
+    return db
+      .select({
+        id: issueComments.id,
+        issueId: issueComments.issueId,
+      })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, companyId),
+          eq(issueComments.createdByRunId, runId),
+        ),
+      )
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function resolveRunIssueCommentTargetIssueId(
+    run: typeof heartbeatRuns.$inferSelect,
+    fallbackIssueId: string,
+  ) {
+    const touchedIssues = new Map<string, { latestAt: number; sourceRank: number }>();
+    const mergeTouchedIssue = (issueId: string | null, latestAt: Date | string | null, sourceRank: number) => {
+      if (!issueId || !latestAt) return;
+      const parsedAt = latestAt instanceof Date ? latestAt : new Date(latestAt);
+      if (Number.isNaN(parsedAt.getTime())) return;
+      const timestamp = parsedAt.getTime();
+      const existing = touchedIssues.get(issueId);
+      if (!existing || timestamp > existing.latestAt || (timestamp === existing.latestAt && sourceRank > existing.sourceRank)) {
+        touchedIssues.set(issueId, { latestAt: timestamp, sourceRank });
+      }
+    };
+
+    const [commentRows, documentRows, workProductRows, activityRows] = await Promise.all([
+      db
+        .select({
+          issueId: issueComments.issueId,
+          latestAt: sql<Date | null>`max(${issueComments.createdAt})`,
+        })
+        .from(issueComments)
+        .where(and(eq(issueComments.companyId, run.companyId), eq(issueComments.createdByRunId, run.id)))
+        .groupBy(issueComments.issueId),
+      db
+        .select({
+          issueId: issueDocuments.issueId,
+          latestAt: sql<Date | null>`max(${documentRevisions.createdAt})`,
+        })
+        .from(documentRevisions)
+        .innerJoin(issueDocuments, eq(documentRevisions.documentId, issueDocuments.documentId))
+        .where(
+          and(
+            eq(documentRevisions.companyId, run.companyId),
+            eq(documentRevisions.createdByRunId, run.id),
+            eq(issueDocuments.companyId, run.companyId),
+            sql`${issueDocuments.key} != ${ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY}`,
+          ),
+        )
+        .groupBy(issueDocuments.issueId),
+      db
+        .select({
+          issueId: issueWorkProducts.issueId,
+          latestAt: sql<Date | null>`max(${issueWorkProducts.createdAt})`,
+        })
+        .from(issueWorkProducts)
+        .where(and(eq(issueWorkProducts.companyId, run.companyId), eq(issueWorkProducts.createdByRunId, run.id)))
+        .groupBy(issueWorkProducts.issueId),
+      db
+        .select({
+          issueId: activityLog.entityId,
+          latestAt: sql<Date | null>`max(${activityLog.createdAt})`,
+        })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, run.companyId),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.runId, run.id),
+          ),
+        )
+        .groupBy(activityLog.entityId),
+    ]);
+
+    for (const row of commentRows) mergeTouchedIssue(row.issueId, row.latestAt, 4);
+    for (const row of documentRows) mergeTouchedIssue(row.issueId, row.latestAt, 3);
+    for (const row of workProductRows) mergeTouchedIssue(row.issueId, row.latestAt, 2);
+    for (const row of activityRows) mergeTouchedIssue(row.issueId, row.latestAt, 1);
+
+    const targetIssueId = [...touchedIssues.entries()]
+      .sort((left, right) =>
+        right[1].latestAt - left[1].latestAt ||
+        right[1].sourceRank - left[1].sourceRank ||
+        left[0].localeCompare(right[0]))
+      .at(0)?.[0];
+
+    return targetIssueId ?? fallbackIssueId;
+  }
+
+  async function findEquivalentMonitorReceiptComment(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    issueId: string;
+    agentId: string;
+    body: string;
+  }) {
+    const contextSnapshot = parseObject(input.run.contextSnapshot);
+    if (readNonEmptyString(contextSnapshot.wakeReason) !== "issue_monitor_due") return null;
+    const nextCheckAt = readNonEmptyString(contextSnapshot.nextCheckAt);
+    if (!nextCheckAt) return null;
+
+    return db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, issueComments.createdByRunId))
+      .where(
+        and(
+          eq(issueComments.companyId, input.run.companyId),
+          eq(issueComments.issueId, input.issueId),
+          eq(issueComments.authorAgentId, input.agentId),
+          eq(issueComments.body, input.body),
+          sql`${issueComments.createdByRunId} <> ${input.run.id}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason' = 'issue_monitor_due'`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'nextCheckAt' = ${nextCheckAt}`,
+        ),
+      )
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function refreshContinuationSummaryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -4603,6 +4744,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = withRecoveryModelProfileHint({
       ...contextSnapshot,
+      issueId,
+      taskId: issueId,
       retryOfRunId: run.id,
       wakeReason: "missing_issue_comment",
       retryReason: "missing_issue_comment",
@@ -4733,8 +4876,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
-    const issueId = readNonEmptyString(contextSnapshot.issueId);
-    if (!issueId) {
+    const fallbackIssueId = readNonEmptyString(contextSnapshot.issueId);
+    if (!fallbackIssueId) {
       if (run.issueCommentStatus !== "not_applicable") {
         await patchRunIssueCommentStatus(run.id, {
           issueCommentStatus: "not_applicable",
@@ -4745,11 +4888,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return { outcome: "not_applicable" as const, queuedRun: null };
     }
 
-    const postedComment = await findRunIssueComment(run.id, run.companyId, issueId);
+    const postedComment = await findLatestRunIssueComment(run.id, run.companyId);
     if (postedComment) {
       await patchRunIssueCommentStatus(run.id, {
         issueCommentStatus: "satisfied",
         issueCommentSatisfiedByCommentId: postedComment.id,
+        issueCommentRetryQueuedAt: null,
+      });
+      return { outcome: "satisfied" as const, queuedRun: null };
+    }
+
+    const issueId = await resolveRunIssueCommentTargetIssueId(run, fallbackIssueId);
+    const summaryComment = buildHeartbeatRunIssueComment(
+      run.resultJson && typeof run.resultJson === "object" && !Array.isArray(run.resultJson)
+        ? run.resultJson as Record<string, unknown>
+        : null,
+    );
+    const equivalentMonitorReceipt = summaryComment
+      ? await findEquivalentMonitorReceiptComment({
+        run,
+        issueId,
+        agentId: run.agentId,
+        body: summaryComment,
+      })
+      : null;
+    if (equivalentMonitorReceipt) {
+      await patchRunIssueCommentStatus(run.id, {
+        issueCommentStatus: "satisfied",
+        issueCommentSatisfiedByCommentId: equivalentMonitorReceipt.id,
         issueCommentRetryQueuedAt: null,
       });
       return { outcome: "satisfied" as const, queuedRun: null };
@@ -8102,11 +8268,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const skipRunIssueComment = parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
         if (issueId && outcome === "succeeded" && !skipRunIssueComment) {
           try {
-            const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
+            const existingRunComment = await findLatestRunIssueComment(livenessRun.id, livenessRun.companyId);
             if (!existingRunComment) {
               const issueComment = buildHeartbeatRunIssueComment(persistedResultJson);
-              if (issueComment) {
-                await issuesSvc.addComment(issueId, issueComment, { agentId: agent.id, runId: livenessRun.id });
+              const targetIssueId = await resolveRunIssueCommentTargetIssueId(livenessRun, issueId);
+              const equivalentMonitorReceipt = issueComment
+                ? await findEquivalentMonitorReceiptComment({
+                  run: livenessRun,
+                  issueId: targetIssueId,
+                  agentId: agent.id,
+                  body: issueComment,
+                })
+                : null;
+              if (issueComment && !equivalentMonitorReceipt) {
+                await issuesSvc.addComment(targetIssueId, issueComment, { agentId: agent.id, runId: livenessRun.id });
               }
             }
           } catch (err) {
@@ -8467,15 +8642,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
         const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
-        // Only human/comment-reopen interactions should revive completed issues;
-        // system follow-ups such as retry or cleanup wakes must not reopen closed work.
-        const shouldReopenDeferredCommentWake =
+        // Only explicit comment-reopen interactions should revive completed issues.
+        // Generic deferred comments may be machine/receipt comments posted through a board actor
+        // while the issue was still active; if the run closes before promotion, suppress them
+        // instead of turning the finished issue back into executable work.
+        const issueIsClosedForDeferredComment =
           deferredCommentIds.length > 0 &&
-          (issue.status === "done" || issue.status === "cancelled") &&
-          (
-            deferred.requestedByActorType === "user" ||
-            deferredWakeReason === "issue_reopened_via_comment"
-          );
+          (issue.status === "done" || issue.status === "cancelled");
+        const shouldReopenDeferredCommentWake =
+          issueIsClosedForDeferredComment &&
+          deferredWakeReason === "issue_reopened_via_comment";
+        if (issueIsClosedForDeferredComment && deferredWakeReason === "issue_commented") {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: "Deferred generic comment wake suppressed because the issue is already closed",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
         let reopenedActivity: LogActivityInput | null = null;
 
         if (shouldReopenDeferredCommentWake) {

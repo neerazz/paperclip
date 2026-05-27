@@ -108,6 +108,33 @@ describe("run liveness continuations", () => {
     expect(decision.nextAttempt).toBe(2);
   });
 
+  it("enqueues runnable_no_evidence continuation on the normal model lane", () => {
+    const decision = decideRunLivenessContinuation({
+      run: run(),
+      issue: issue(),
+      agent: agent(),
+      livenessState: "runnable_no_evidence",
+      livenessReason: "Run described runnable work but produced no concrete action evidence",
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+    });
+
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.payload).toMatchObject({
+      issueId,
+      sourceRunId: runId,
+      livenessState: "runnable_no_evidence",
+      continuationAttempt: 1,
+    });
+    expect(decision.payload).not.toHaveProperty("modelProfile");
+    expect(decision.contextSnapshot).toMatchObject({
+      wakeReason: RUN_LIVENESS_CONTINUATION_REASON,
+      livenessContinuationState: "runnable_no_evidence",
+    });
+  });
+
   it("leaves advanced terminal runs to stranded issue recovery instead of bounded liveness continuation", () => {
     const decision = decideRunLivenessContinuation({
       run: run(),
