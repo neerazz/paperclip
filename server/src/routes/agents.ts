@@ -30,6 +30,8 @@ import {
   LOW_TRUST_REVIEW_PRESET,
 } from "@paperclipai/shared";
 import {
+  isForbiddenConfigEnvKey,
+  parseObject,
   resolvePaperclipInstanceRootForAdapter,
   readPaperclipSkillSyncPreference,
   writePaperclipSkillSyncPreference,
@@ -54,6 +56,7 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -189,6 +192,7 @@ export function agentRoutes(
   const environmentRuntime = environmentRuntimeService(db, {
     pluginWorkerManager: options.pluginWorkerManager,
   });
+  const runRedactions = createRunSecretRedactionRegistry(db);
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: options.pluginWorkerManager,
   });
@@ -1836,20 +1840,77 @@ export function agentRoutes(
 
       let releaseStatus: "released" | "failed" = "released";
       try {
+        // Mirror the run path (resolveExecutionRunAdapterConfig): the selected
+        // environment's envVars are the base env layer and the agent's
+        // adapterConfig.env wins on key conflicts. Without this merge the probe
+        // cannot see environment-level auth (e.g. CLAUDE_CODE_OAUTH_TOKEN) that
+        // real runs receive.
+        const environmentEnvChecks: AdapterEnvironmentCheck[] = [];
+        let effectiveAdapterConfig = runtimeAdapterConfig;
+        if (requestedEnvironmentId) {
+          const selectedEnvironment = await environmentsSvc.getById(requestedEnvironmentId);
+          const environmentEnv = Object.fromEntries(
+            Object.entries(parseObject(selectedEnvironment?.envVars)).filter(
+              ([key]) => !isForbiddenConfigEnvKey(key),
+            ),
+          );
+          if (Object.keys(environmentEnv).length > 0) {
+            const environmentSecretContext = buildActorSecretContext(req, {
+              consumerType: "environment",
+              consumerId: requestedEnvironmentId,
+            });
+            const missingBindings =
+              typeof secretsSvc.collectMissingRuntimeBindings === "function"
+                ? await secretsSvc.collectMissingRuntimeBindings(
+                    companyId,
+                    environmentEnv,
+                    environmentSecretContext,
+                  )
+                : [];
+            const missingKeys = new Set(missingBindings.map((binding) => binding.envKey));
+            if (missingKeys.size > 0) {
+              environmentEnvChecks.push({
+                code: "environment_env_binding_missing",
+                level: "error",
+                message: `Environment variables with missing secret bindings were skipped: ${[...missingKeys].join(", ")}.`,
+                hint: "Re-save the environment's variables to restore the secret binding, then test again.",
+              });
+            }
+            const resolvableEnvironmentEnv = Object.fromEntries(
+              Object.entries(environmentEnv).filter(([key]) => !missingKeys.has(key)),
+            );
+            const environmentEnvResolution = await secretsSvc.resolveEnvBindings(
+              companyId,
+              resolvableEnvironmentEnv,
+              environmentSecretContext,
+            );
+            if (Object.keys(environmentEnvResolution.env).length > 0) {
+              effectiveAdapterConfig = {
+                ...runtimeAdapterConfig,
+                env: {
+                  ...environmentEnvResolution.env,
+                  ...parseObject(runtimeAdapterConfig.env),
+                },
+              };
+            }
+          }
+        }
+
         // If the caller explicitly selected an environment, never fall back to
         // probing the host when we couldn't resolve that environment's
         // execution target. Surface the diagnostic checks instead.
         if (requestedEnvironmentId && !executionTarget && fallbackChecks.length > 0) {
-          const status: AdapterEnvironmentTestResult["status"] = fallbackChecks.some((c) => c.level === "error")
+          const combinedChecks = [...fallbackChecks, ...environmentEnvChecks];
+          const status: AdapterEnvironmentTestResult["status"] = combinedChecks.some((c) => c.level === "error")
             ? "fail"
-            : fallbackChecks.some((c) => c.level === "warn")
+            : combinedChecks.some((c) => c.level === "warn")
               ? "warn"
               : "pass";
           if (status === "fail") releaseStatus = "failed";
           const synthesized: AdapterEnvironmentTestResult = {
             adapterType: type,
             status,
-            checks: fallbackChecks,
+            checks: combinedChecks,
             testedAt: new Date().toISOString(),
           };
           res.json(synthesized);
@@ -1859,15 +1920,24 @@ export function agentRoutes(
         const result = await adapter.testEnvironment({
           companyId,
           adapterType: type,
-          config: runtimeAdapterConfig,
+          config: effectiveAdapterConfig,
           executionTarget,
           environmentName,
         });
 
-        if (result.status === "fail") releaseStatus = "failed";
+        const prefixChecks = [
+          ...(sandboxIdentityCheck ? [sandboxIdentityCheck] : []),
+          ...environmentEnvChecks,
+        ];
+        // A missing environment secret binding blocks real dispatch
+        // (ConfigurationIncompleteFailure in the heartbeat), so the test
+        // reports fail even when the adapter probe itself passed.
+        const status = environmentEnvChecks.some((c) => c.level === "error") ? "fail" : result.status;
+        if (status === "fail") releaseStatus = "failed";
         res.json({
           ...result,
-          checks: sandboxIdentityCheck ? [sandboxIdentityCheck, ...result.checks] : result.checks,
+          status,
+          checks: prefixChecks.length > 0 ? [...prefixChecks, ...result.checks] : result.checks,
         });
       } catch (err) {
         releaseStatus = "failed";
@@ -3649,7 +3719,7 @@ export function agentRoutes(
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
     const summary = req.query.summary === "true" || req.query.summary === "1";
     const runs = await heartbeat.list(companyId, agentId, limit, { summary });
-    res.json(runs);
+    res.json(await Promise.all(runs.map((run) => runRedactions.redactForRun(companyId, run.id, run))));
   });
 
   router.get("/companies/:companyId/live-runs", async (req, res) => {
@@ -3724,14 +3794,14 @@ export function agentRoutes(
         .limit(targetRunCount - liveRuns.length);
 
       const rows = [...liveRuns, ...recentRuns];
-      res.json(await Promise.all(rows.map(async (run) => ({
+      res.json(await Promise.all(rows.map(async (run) => runRedactions.redactForRun(companyId, run.id, {
         ...heartbeat.decorateActiveRunStatus(run),
         outputSilence: await heartbeat.buildRunOutputSilence(run),
       }))));
       return;
     }
 
-    res.json(await Promise.all(liveRuns.map(async (run) => ({
+    res.json(await Promise.all(liveRuns.map(async (run) => runRedactions.redactForRun(companyId, run.id, {
       ...heartbeat.decorateActiveRunStatus(run),
       outputSilence: await heartbeat.buildRunOutputSilence(run),
     }))));
@@ -3743,12 +3813,14 @@ export function agentRoutes(
     if (!run) return;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
-    res.json(
+    res.json(await runRedactions.redactForRun(
+      run.companyId,
+      run.id,
       redactCurrentUserValue(
         { ...decoratedRun, retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
         await getCurrentUserRedactionOptions(),
       ),
-    );
+    ));
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
@@ -3828,7 +3900,7 @@ export function agentRoutes(
         payload: redactEventPayload(event.payload),
       }, currentUserRedactionOptions),
     );
-    res.json(redactedEvents);
+    res.json(await runRedactions.redactForRun(run.companyId, run.id, redactedEvents));
   });
 
   router.get("/heartbeat-runs/:runId/log", async (req, res) => {
@@ -3844,7 +3916,7 @@ export function agentRoutes(
     });
 
     res.set("Cache-Control", "no-cache, no-store");
-    res.json(result);
+    res.json(await runRedactions.redactForRun(run.companyId, run.id, result));
   });
 
   router.get("/heartbeat-runs/:runId/workspace-operations", async (req, res) => {

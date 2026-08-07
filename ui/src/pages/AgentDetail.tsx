@@ -14,6 +14,7 @@ import { heartbeatsApi } from "../api/heartbeats";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { ApiError } from "../api/client";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
+import { SHOW_TASK_PRIORITY_UI } from "../lib/ui-flags";
 import { activityApi } from "../api/activity";
 import { accessApi } from "../api/access";
 import { issuesApi } from "../api/issues";
@@ -24,6 +25,7 @@ import { useCompany } from "../context/CompanyContext";
 import { useToastActions } from "../context/ToastContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
+import { copyTextToClipboard } from "../lib/clipboard";
 import { AgentSkillsTab } from "./agent-skills/AgentSkillsTab";
 import { AgentConfigForm } from "../components/AgentConfigForm";
 import { PageTabBar } from "../components/PageTabBar";
@@ -1541,9 +1543,12 @@ function AgentOverview({
         <ChartCard title="Run Activity" subtitle="Last 14 days">
           <RunActivityChart runs={runs} />
         </ChartCard>
-        <ChartCard title="Tasks by Priority" subtitle="Last 14 days">
-          <PriorityChart issues={assignedIssues} />
-        </ChartCard>
+        {/* PAP-411: "Tasks by Priority" chart hidden behind SHOW_TASK_PRIORITY_UI. */}
+        {SHOW_TASK_PRIORITY_UI && (
+          <ChartCard title="Tasks by Priority" subtitle="Last 14 days">
+            <PriorityChart issues={assignedIssues} />
+          </ChartCard>
+        )}
         <ChartCard title="Tasks by Status" subtitle="Last 14 days">
           <IssueStatusChart issues={assignedIssues} />
         </ChartCard>
@@ -4081,6 +4086,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
 
 function KeysTab({ agentId, companyId }: { agentId: string; companyId?: string }) {
   const queryClient = useQueryClient();
+  const { pushToast } = useToastActions();
   const [newKeyName, setNewKeyName] = useState("");
   const [newToken, setNewToken] = useState<string | null>(null);
   const [tokenVisible, setTokenVisible] = useState(false);
@@ -4110,9 +4116,14 @@ function KeysTab({ agentId, companyId }: { agentId: string; companyId?: string }
 
   function copyToken() {
     if (!newToken) return;
-    navigator.clipboard.writeText(newToken);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    void copyTextToClipboard(newToken)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      })
+      .catch(() => {
+        pushToast({ title: "Copy failed", body: "Clipboard access is unavailable.", tone: "error" });
+      });
   }
 
   const activeKeys = (keys ?? []).filter((k: AgentKey) => !k.revokedAt);
