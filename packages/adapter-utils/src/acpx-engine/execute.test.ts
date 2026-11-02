@@ -35,6 +35,7 @@ import {
   parseGeminiVersionParts,
   referencedSourceContentSignature,
   resolveStalledToolTimeoutMs,
+  resolveOutputInactivityTimeoutMs,
   rewriteGeminiAcpFlagForVersion,
   summarizeAcpStopActivity,
   summarizeAcpxTurnUsage,
@@ -45,6 +46,7 @@ import {
   ACPX_HANDSHAKE_TIMEOUT_MS,
   ACPX_STALLED_TOOL_MARGIN_MS,
   ACPX_STALLED_TOOL_TIMEOUT_MS,
+  ACPX_OUTPUT_INACTIVITY_TIMEOUT_MS,
 } from "./constants.js";
 import { sessionCodec } from "./session-codec.js";
 import { runChildProcess } from "../server-utils.js";
@@ -3897,6 +3899,200 @@ describe("ACP activity diagnostics", () => {
     expect(result.timedOut).toBe(true);
     expect(result.errorCode).toBe("acpx_timeout");
   }, 15_000);
+
+  it("ends a turn as a failure when the agent stops sending any ACP update", async () => {
+    const root = await makeTempRoot();
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+    let currentNow = 1000;
+    let releaseTurn: (() => void) | null = null;
+    const turnCancelled = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    const cancelReasons: Array<string | undefined> = [];
+    const logs: string[] = [];
+    const execute = createAcpxEngineExecutor({
+      now: () => currentNow,
+      outputInactivityTimeoutMs: 5000,
+      stalledToolCheckIntervalMs: 5,
+      createRuntime: () => ({
+        ...buildRuntime(),
+        startTurn: () => ({
+          events: (async function* () {
+            // The provider says something, then goes silent without exiting
+            // and with no tool call pending.
+            yield { type: "text_delta", text: "starting" };
+            currentNow = 7000;
+            await turnCancelled;
+          })(),
+          result: turnCancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" })),
+          cancel: async ({ reason }: { reason?: string }) => {
+            cancelReasons.push(reason);
+            releaseTurn?.();
+          },
+        }),
+      }) as never,
+    });
+    const result = await execute({
+      runId: "output-inactivity", agent: { id: "agent-1", companyId: "company-1" }, runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd },
+      context: {}, onMeta: async () => {}, onLog: async (_stream: string, text: string) => { logs.push(text); },
+    } as never);
+    expect(cancelReasons).toEqual(["paperclip output inactivity watchdog"]);
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("acpx_output_inactivity");
+    expect(result.errorMessage).toContain("sent no ACP update");
+    expect(result.resultJson).toMatchObject({
+      status: "failed",
+      acpOutputInactivitySilentMs: 6000,
+      acpLastEventAgeAtStopMs: 6000,
+    });
+    expect(result.resultJson).not.toHaveProperty("acpStalledToolKind");
+    expect(logs.join("")).toContain("[paperclip] No ACP update for 6s; ending the turn (outputInactivityTimeoutMs=5000).");
+  }, 15_000);
+
+  it("ends a silent turn within the cancel deadline when the agent ignores the cancel", async () => {
+    const root = await makeTempRoot();
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+    let currentNow = 1000;
+    const closeStreamReasons: Array<string | undefined> = [];
+    let endEvents: (() => void) | null = null;
+    const eventsEnded = new Promise<void>((resolve) => { endEvents = resolve; });
+    const execute = createAcpxEngineExecutor({
+      now: () => currentNow,
+      outputInactivityTimeoutMs: 5000,
+      stalledToolCheckIntervalMs: 5,
+      duplexLossCancelDeadlineMs: 25,
+      createRuntime: () => ({
+        ...buildRuntime(),
+        startTurn: () => ({
+          events: (async function* () {
+            // The provider never emits a first event at all.
+            currentNow = 9000;
+            await eventsEnded;
+          })(),
+          result: new Promise<never>(() => {}),
+          cancel: async () => {},
+          closeStream: async ({ reason }: { reason?: string }) => {
+            closeStreamReasons.push(reason);
+            endEvents?.();
+          },
+        }),
+      }) as never,
+    });
+    const result = await execute({
+      runId: "output-inactivity-silent-agent", agent: { id: "agent-1", companyId: "company-1" }, runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd },
+      context: {}, onMeta: async () => {}, onLog: async () => {},
+    } as never);
+    expect(closeStreamReasons).toEqual(["paperclip output inactivity cancel deadline"]);
+    expect(result.errorCode).toBe("acpx_output_inactivity");
+    expect(result.resultJson).toMatchObject({
+      status: "failed",
+      stopReason: "paperclip_output_inactivity_deadline",
+      acpOutputInactivitySilentMs: 8000,
+    });
+  }, 15_000);
+
+  it("leaves a long turn alone while ACP updates keep arriving within the bound", async () => {
+    const root = await makeTempRoot();
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+    let currentNow = 1000;
+    const cancelReasons: Array<string | undefined> = [];
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+    const execute = createAcpxEngineExecutor({
+      now: () => currentNow,
+      outputInactivityTimeoutMs: 5000,
+      stalledToolCheckIntervalMs: 5,
+      createRuntime: () => ({
+        ...buildRuntime(),
+        startTurn: () => ({
+          events: (async function* () {
+            // The turn runs far past the bound in total, but every gap is
+            // shorter than it, and the watchdog checks between them.
+            for (let step = 0; step < 4; step += 1) {
+              currentNow += 4000;
+              await tick();
+              yield { type: "text_delta", text: `step ${step}` };
+            }
+            yield { type: "done", stopReason: "end_turn" };
+          })(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async ({ reason }: { reason?: string }) => { cancelReasons.push(reason); },
+        }),
+      }) as never,
+    });
+    const result = await execute({
+      runId: "output-live", agent: { id: "agent-1", companyId: "company-1" }, runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd },
+      context: {}, onMeta: async () => {}, onLog: async () => {},
+    } as never);
+    expect(cancelReasons).toEqual([]);
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBeNull();
+    expect(result.resultJson).not.toHaveProperty("acpOutputInactivitySilentMs");
+  }, 15_000);
+
+  it("does not watch output when outputInactivityTimeoutMs is null", async () => {
+    const root = await makeTempRoot();
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+    let currentNow = 1000;
+    let releaseTurn: (() => void) | null = null;
+    const turnCancelled = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    const cancelReasons: Array<string | undefined> = [];
+    const execute = createAcpxEngineExecutor({
+      now: () => currentNow,
+      stalledToolCheckIntervalMs: 5,
+      createRuntime: () => ({
+        ...buildRuntime(),
+        startTurn: () => ({
+          events: (async function* () {
+            currentNow = 10_000_000;
+            await turnCancelled;
+          })(),
+          result: turnCancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" })),
+          cancel: async ({ reason }: { reason?: string }) => {
+            cancelReasons.push(reason);
+            releaseTurn?.();
+          },
+        }),
+      }) as never,
+    });
+    const result = await execute({
+      runId: "output-watchdog-off", agent: { id: "agent-1", companyId: "company-1" }, runtime: {},
+      config: {
+        agent: "codex", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd,
+        outputInactivityTimeoutMs: null, timeoutSec: 1,
+      },
+      context: {}, onMeta: async () => {}, onLog: async () => {},
+    } as never);
+    // Only the wall-clock timeout ended this turn.
+    expect(cancelReasons).toHaveLength(1);
+    expect(cancelReasons[0]).not.toBe("paperclip output inactivity watchdog");
+    expect(result.timedOut).toBe(true);
+    expect(result.errorCode).toBe("acpx_timeout");
+  }, 15_000);
+});
+
+describe("resolveOutputInactivityTimeoutMs", () => {
+  it("watches Codex turns by default, matching the CLI lane", () => {
+    expect(resolveOutputInactivityTimeoutMs({}, "codex")).toBe(ACPX_OUTPUT_INACTIVITY_TIMEOUT_MS);
+    expect(resolveOutputInactivityTimeoutMs({ outputInactivityTimeoutMs: 0 }, "codex")).toBe(ACPX_OUTPUT_INACTIVITY_TIMEOUT_MS);
+    expect(resolveOutputInactivityTimeoutMs({ outputInactivityTimeoutMs: -5 }, "codex")).toBe(ACPX_OUTPUT_INACTIVITY_TIMEOUT_MS);
+    expect(resolveOutputInactivityTimeoutMs({ outputInactivityTimeoutMs: "600000" }, "codex")).toBe(ACPX_OUTPUT_INACTIVITY_TIMEOUT_MS);
+  });
+
+  it("honors a configured bound and the null escape hatch", () => {
+    expect(resolveOutputInactivityTimeoutMs({ outputInactivityTimeoutMs: 600_000 }, "codex")).toBe(600_000);
+    expect(resolveOutputInactivityTimeoutMs({ outputInactivityTimeoutMs: null }, "codex")).toBe(0);
+  });
+
+  it("leaves other agents unwatched unless the adapter config sets a bound", () => {
+    expect(resolveOutputInactivityTimeoutMs({}, "claude")).toBe(0);
+    expect(resolveOutputInactivityTimeoutMs({ outputInactivityTimeoutMs: 120_000 }, "claude")).toBe(120_000);
+  });
 });
 
 describe("resolveStalledToolTimeoutMs", () => {

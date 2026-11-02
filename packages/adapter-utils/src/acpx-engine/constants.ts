@@ -50,6 +50,15 @@ export const ACPX_STALLED_TOOL_MARGIN_MS = 15 * 60 * 1000;
 export const ACPX_STALLED_TOOL_CHECK_INTERVAL_MS = 60_000;
 export const ACPX_TOOL_STALLED_ERROR_CODE = "acpx_tool_stalled";
 
+// How long a turn may go without any ACP update (text, thought, tool call,
+// tool update, status, or usage) before the host ends it. This is the ACP
+// counterpart of the Codex CLI lane's output-inactivity monitor: a provider
+// that stops emitting events without exiting would otherwise hold the turn
+// until the wall-clock timeout, which defaults to none. Adapters opt in
+// through `outputInactivityTimeoutMs`; Codex turns use this default.
+export const ACPX_OUTPUT_INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000;
+export const ACPX_OUTPUT_INACTIVITY_ERROR_CODE = "acpx_output_inactivity";
+
 // The closed ACP `ToolKind` enum. Run diagnostics may report these labels for
 // pending tool calls; tool titles, names, and inputs never leave the run.
 // Any other reported kind is collapsed to "unknown".
